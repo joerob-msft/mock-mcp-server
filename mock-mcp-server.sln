@@ -1,0 +1,24 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.5.2.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MockMcpServer", "MockMcpServer.csproj", "{FD329586-267D-1DF7-F971-872464EF9E7F}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{FD329586-267D-1DF7-F971-872464EF9E7F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{FD329586-267D-1DF7-F971-872464EF9E7F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{FD329586-267D-1DF7-F971-872464EF9E7F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{FD329586-267D-1DF7-F971-872464EF9E7F}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {866F5E48-9C87-4F4A-9BF6-E67F2888D167}
+	EndGlobalSection
+EndGlobal
