@@ -2,15 +2,14 @@ using System.Collections.Concurrent;
 using System.IdentityModel.Tokens.Jwt;
 using System.Text;
 using System.Text.Json;
-using Microsoft.Azure.Functions.Worker;
-using Microsoft.Azure.Functions.Worker.Http;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 
-namespace MockMcpServer.Functions;
+namespace MockMcpServer;
 
-public class McpFunctions
+public class McpServer
 {
-    private readonly ILogger<McpFunctions> _logger;
+    private readonly ILogger<McpServer> _logger;
 
     // ANSI color codes for terminal output
     private const string CYAN = "\u001b[36m";
@@ -25,7 +24,7 @@ public class McpFunctions
     private static readonly bool VerboseLogging = 
         Environment.GetEnvironmentVariable("MCP_VERBOSE_LOGGING")?.ToLower() == "true";
 
-    public McpFunctions(ILogger<McpFunctions> logger)
+    public McpServer(ILogger<McpServer> logger)
     {
         _logger = logger;
     }
@@ -71,6 +70,15 @@ public class McpFunctions
     private record BackendAuthPending(
         string ProxyToken, string State, DateTime CreatedAt);
 
+    // SSE connections - maps proxy tokens to active SSE connections
+    private static readonly ConcurrentDictionary<string, SseConnection> _sseConnections = new();
+
+    private class SseConnection
+    {
+        public HttpResponse Response { get; init; } = null!;
+        public CancellationToken RequestAborted { get; init; }
+    }
+
     // In Entra mode, scopes must reference the AAD app's resource URI
     private static string GetScopesSupported() =>
         AuthMode == "entra" && !string.IsNullOrEmpty(AzureClientId)
@@ -78,29 +86,56 @@ public class McpFunctions
             : "mcp.tools.execute";
 
     /// <summary>
+    /// Sends SSE notification for tools/list_changed to a connected client.
+    /// </summary>
+    public static async Task NotifyToolsChanged(string proxyToken)
+    {
+        if (_sseConnections.TryGetValue(proxyToken, out var conn))
+        {
+            try
+            {
+                if (!conn.RequestAborted.IsCancellationRequested)
+                {
+                    var data = JsonSerializer.Serialize(new { jsonrpc = "2.0", method = "notifications/tools/list_changed" });
+                    await conn.Response.WriteAsync($"event: message\ndata: {data}\n\n", conn.RequestAborted);
+                    await conn.Response.Body.FlushAsync(conn.RequestAborted);
+                    Console.WriteLine($"{GREEN}   ✓ SSE notification sent: tools/list_changed{RESET}");
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Client disconnected
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"{RED}   ✗ SSE notification error: {ex.Message}{RESET}");
+            }
+        }
+    }
+
+    /// <summary>
     /// GET /mcp - MCP root endpoint
     /// Returns 200 if valid bearer token with correct audience is provided.
     /// Returns 401 with PRM pointer if no token or invalid token.
+    /// Supports SSE when Accept: text/event-stream is present.
     /// </summary>
-    [Function("McpGet")]
-    public async Task<HttpResponseData> GetMcp(
-        [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "mcp")] HttpRequestData req)
+    public async Task HandleMcpGet(HttpContext context)
     {
-        await LogRequestDetails(req, "GET");
+        await LogRequestDetails(context, "GET");
 
         // Validate bearer token
-        var (isValid, tokenError) = ValidateBearerToken(req);
+        var (isValid, tokenError) = ValidateBearerToken(context);
         
         if (!isValid)
         {
             // Return 401 with WWW-Authenticate header pointing to PRM
             Console.WriteLine($"{RED}   ✗ Token validation failed: {tokenError}{RESET}");
             
-            var unauthorizedResponse = req.CreateResponse(System.Net.HttpStatusCode.Unauthorized);
-            unauthorizedResponse.Headers.Add("Content-Type", "application/json");
+            context.Response.StatusCode = 401;
+            context.Response.Headers["Content-Type"] = "application/json";
             
-            var baseUrl = GetBaseUrl(req);
-            unauthorizedResponse.Headers.Add("WWW-Authenticate", $"Bearer resource_metadata=\"{baseUrl}/.well-known/oauth-protected-resource\"");
+            var baseUrl = GetBaseUrl(context);
+            context.Response.Headers["WWW-Authenticate"] = $"Bearer resource_metadata=\"{baseUrl}/.well-known/oauth-protected-resource\"";
 
             var errorBody = new
             {
@@ -108,32 +143,73 @@ public class McpFunctions
                 error_description = tokenError ?? "Authentication required"
             };
 
-            await unauthorizedResponse.WriteStringAsync(JsonSerializer.Serialize(errorBody, new JsonSerializerOptions 
+            await context.Response.WriteAsync(JsonSerializer.Serialize(errorBody, new JsonSerializerOptions 
             { 
                 WriteIndented = true 
             }));
 
             LogResponse("GET /mcp", 401, tokenError ?? "Auth required - see WWW-Authenticate header");
-            return unauthorizedResponse;
+            return;
         }
 
         Console.WriteLine($"{GREEN}   ✓ Bearer token validated{RESET}");
 
         // Check if client wants SSE stream (Streamable HTTP transport)
-        var acceptHeader = req.Headers.TryGetValues("Accept", out var acceptValues) 
-            ? string.Join(",", acceptValues) : "";
+        var acceptHeader = context.Request.Headers.TryGetValue("Accept", out var acceptValues) 
+            ? string.Join(",", acceptValues.ToArray()) : "";
         
         if (acceptHeader.Contains("text/event-stream"))
         {
-            // SSE notification stream not supported — return 405 per MCP Streamable HTTP spec
-            Console.WriteLine($"{CYAN}   ℹ SSE stream requested but not supported — returning 405{RESET}");
-            var sseResponse = req.CreateResponse(System.Net.HttpStatusCode.MethodNotAllowed);
-            LogResponse("GET /mcp", 405, "SSE not supported");
-            return sseResponse;
+            // SSE notification stream
+            Console.WriteLine($"{CYAN}   ℹ SSE stream requested — opening persistent connection{RESET}");
+
+            var proxyToken = ExtractBearerToken(context);
+            if (proxyToken == null)
+            {
+                context.Response.StatusCode = 401;
+                await context.Response.WriteAsync("Missing bearer token for SSE");
+                return;
+            }
+
+            context.Response.StatusCode = 200;
+            context.Response.Headers["Content-Type"] = "text/event-stream";
+            context.Response.Headers["Cache-Control"] = "no-cache";
+            context.Response.Headers["Connection"] = "keep-alive";
+            await context.Response.Body.FlushAsync();
+
+            // Register the SSE connection
+            var conn = new SseConnection
+            {
+                Response = context.Response,
+                RequestAborted = context.RequestAborted
+            };
+            _sseConnections[proxyToken] = conn;
+            Console.WriteLine($"{GREEN}   ✓ SSE connection registered for token: {proxyToken[..Math.Min(8, proxyToken.Length)]}...{RESET}");
+
+            try
+            {
+                // Send keepalive comments every 30 seconds until client disconnects
+                while (!context.RequestAborted.IsCancellationRequested)
+                {
+                    await Task.Delay(30_000, context.RequestAborted);
+                    await context.Response.WriteAsync(": keepalive\n\n", context.RequestAborted);
+                    await context.Response.Body.FlushAsync(context.RequestAborted);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Client disconnected — expected
+            }
+            finally
+            {
+                _sseConnections.TryRemove(proxyToken, out _);
+                Console.WriteLine($"{YELLOW}   ⚠ SSE connection closed for token: {proxyToken[..Math.Min(8, proxyToken.Length)]}...{RESET}");
+            }
+            return;
         }
 
-        var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
-        response.Headers.Add("Content-Type", "application/json");
+        context.Response.StatusCode = 200;
+        context.Response.Headers["Content-Type"] = "application/json";
 
         var responseBody = new
         {
@@ -146,46 +222,25 @@ public class McpFunctions
             }
         };
 
-        await response.WriteStringAsync(JsonSerializer.Serialize(responseBody, new JsonSerializerOptions 
+        await context.Response.WriteAsync(JsonSerializer.Serialize(responseBody, new JsonSerializerOptions 
         { 
             WriteIndented = true 
         }));
 
         LogResponse("GET /mcp", 200, "Authenticated");
-        return response;
     }
 
     /// <summary>
-    /// GET /.well-known/oauth-protected-resource - Protected Resource Metadata
-    /// Tells clients which resource to request tokens for and which authorization servers to use.
-    /// Per RFC 9728, `resource` must match the protected resource URL (i.e., the /mcp endpoint).
+    /// GET /.well-known/oauth-protected-resource[/mcp] - Protected Resource Metadata
     /// </summary>
-    [Function("ProtectedResourceMetadata")]
-    public async Task<HttpResponseData> GetProtectedResourceMetadata(
-        [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = ".well-known/oauth-protected-resource")] HttpRequestData req)
+    public async Task HandlePRM(HttpContext context)
     {
-        return await ServeProtectedResourceMetadata(req);
-    }
+        await LogRequestDetails(context, "GET");
 
-    /// <summary>
-    /// GET /.well-known/oauth-protected-resource/mcp - PRM at resource-specific path
-    /// Some clients append the resource path to the well-known base.
-    /// </summary>
-    [Function("ProtectedResourceMetadataMcp")]
-    public async Task<HttpResponseData> GetProtectedResourceMetadataMcp(
-        [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = ".well-known/oauth-protected-resource/mcp")] HttpRequestData req)
-    {
-        return await ServeProtectedResourceMetadata(req);
-    }
-
-    private async Task<HttpResponseData> ServeProtectedResourceMetadata(HttpRequestData req)
-    {
-        await LogRequestDetails(req, "GET");
-
-        var baseUrl = GetBaseUrl(req);
+        var baseUrl = GetBaseUrl(context);
         var resourceUrl = $"{baseUrl}/mcp";
-        var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
-        response.Headers.Add("Content-Type", "application/json");
+        context.Response.StatusCode = 200;
+        context.Response.Headers["Content-Type"] = "application/json";
 
         var metadata = new
         {
@@ -194,28 +249,24 @@ public class McpFunctions
             scopes_supported = new[] { GetScopesSupported() }
         };
 
-        await response.WriteStringAsync(JsonSerializer.Serialize(metadata, new JsonSerializerOptions 
+        await context.Response.WriteAsync(JsonSerializer.Serialize(metadata, new JsonSerializerOptions 
         { 
             WriteIndented = true 
         }));
 
         LogResponse("GET /.well-known/oauth-protected-resource", 200, $"resource={resourceUrl}");
-        return response;
     }
 
     /// <summary>
     /// GET /.well-known/oauth-authorization-server - OAuth Authorization Server Metadata
-    /// Advertises proxy-owned OAuth endpoints for CIMD-based auth.
     /// </summary>
-    [Function("OAuthAuthorizationServerMetadata")]
-    public async Task<HttpResponseData> GetOAuthAuthorizationServerMetadata(
-        [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = ".well-known/oauth-authorization-server")] HttpRequestData req)
+    public async Task HandleAuthServerMetadata(HttpContext context)
     {
-        await LogRequestDetails(req, "GET");
+        await LogRequestDetails(context, "GET");
 
-        var baseUrl = GetBaseUrl(req);
-        var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
-        response.Headers.Add("Content-Type", "application/json");
+        var baseUrl = GetBaseUrl(context);
+        context.Response.StatusCode = 200;
+        context.Response.Headers["Content-Type"] = "application/json";
 
         var metadata = new
         {
@@ -230,28 +281,23 @@ public class McpFunctions
             client_id_metadata_document_supported = true
         };
 
-        await response.WriteStringAsync(JsonSerializer.Serialize(metadata, new JsonSerializerOptions 
+        await context.Response.WriteAsync(JsonSerializer.Serialize(metadata, new JsonSerializerOptions 
         { 
             WriteIndented = true 
         }));
 
         LogResponse("GET /.well-known/oauth-authorization-server", 200, $"issuer={baseUrl}");
-        return response;
     }
 
     /// <summary>
     /// POST /mcp - Main MCP API endpoint
-    /// initialize, tools/list, resources/list, prompts/list are allowed without auth.
-    /// tools/call requires a valid bearer token.
     /// </summary>
-    [Function("McpPost")]
-    public async Task<HttpResponseData> PostMcp(
-        [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "mcp")] HttpRequestData req)
+    public async Task HandleMcpPost(HttpContext context)
     {
-        await LogRequestDetails(req, "POST");
+        await LogRequestDetails(context, "POST");
 
         // Read and parse the request body first to determine the method
-        string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
+        string requestBody = await new StreamReader(context.Request.Body).ReadToEndAsync();
 
         string method = "unknown";
         int? requestId = null;
@@ -291,11 +337,12 @@ public class McpFunctions
 
         if (requiresAuth)
         {
-            var (isValid, tokenError) = ValidateBearerToken(req);
+            var (isValid, tokenError) = ValidateBearerToken(context);
             if (!isValid)
             {
                 Console.WriteLine($"{RED}   ✗ Token validation failed: {tokenError}{RESET}");
-                return await CreateUnauthorizedResponse(req, tokenError ?? "Invalid or missing token");
+                await WriteUnauthorizedResponse(context, tokenError ?? "Invalid or missing token");
+                return;
             }
             Console.WriteLine($"{GREEN}   ✓ Bearer token validated{RESET}");
         }
@@ -304,8 +351,8 @@ public class McpFunctions
             Console.WriteLine($"{CYAN}   ℹ Method '{method}' does not require auth{RESET}");
         }
 
-        var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
-        response.Headers.Add("Content-Type", "application/json");
+        context.Response.StatusCode = 200;
+        context.Response.Headers["Content-Type"] = "application/json";
 
         // Generate response based on the method
         object responseBody = method switch
@@ -318,7 +365,7 @@ public class McpFunctions
                     protocolVersion = "2024-11-05",
                     capabilities = new
                     {
-                        tools = new { listChanged = true }, // Tools list can change after consent
+                        tools = new { listChanged = true },
                         resources = new { subscribe = false, listChanged = false },
                         prompts = new { listChanged = false }
                     },
@@ -330,8 +377,8 @@ public class McpFunctions
                 },
                 id = requestId ?? 1
             },
-            "tools/list" => GenerateToolsListResponse(requestId, req),
-            "tools/call" => GenerateToolCallResponse(toolName, toolArguments, requestId, req),
+            "tools/list" => GenerateToolsListResponse(requestId, context),
+            "tools/call" => GenerateToolCallResponse(toolName, toolArguments, requestId, context),
             "resources/list" => new
             {
                 jsonrpc = "2.0",
@@ -370,31 +417,32 @@ public class McpFunctions
         {
             Console.WriteLine($"{GREEN}   Response: {jsonResponse}{RESET}");
         }
-        await response.WriteStringAsync(jsonResponse);
+        await context.Response.WriteAsync(jsonResponse);
 
         LogResponse($"POST /mcp ({method})", 200, toolName != null ? $"tool={toolName}" : null);
-        return response;
     }
 
-    private async Task LogRequestDetails(HttpRequestData req, string httpMethod)
+    private async Task LogRequestDetails(HttpContext context, string httpMethod)
     {
-        // Concise colored output
-        var authHeader = req.Headers.TryGetValues("Authorization", out var authVals) 
+        var authHeader = context.Request.Headers.TryGetValue("Authorization", out var authVals) 
             ? (authVals.FirstOrDefault()?.StartsWith("Bearer ") == true ? "Bearer [token]" : authVals.FirstOrDefault()) 
             : "none";
         
-        Console.WriteLine($"\n{CYAN}{BOLD}▶▶▶ INCOMING {httpMethod} {req.Url.AbsolutePath}{RESET}");
-        Console.WriteLine($"{CYAN}   URL: {req.Url}{RESET}");
+        var path = context.Request.Path.Value;
+        var fullUrl = $"{context.Request.Scheme}://{context.Request.Host}{context.Request.Path}{context.Request.QueryString}";
+        
+        Console.WriteLine($"\n{CYAN}{BOLD}▶▶▶ INCOMING {httpMethod} {path}{RESET}");
+        Console.WriteLine($"{CYAN}   URL: {fullUrl}{RESET}");
         Console.WriteLine($"{CYAN}   Auth: {authHeader}{RESET}");
         
         if (VerboseLogging)
         {
             Console.WriteLine($"{CYAN}   Headers:{RESET}");
-            foreach (var header in req.Headers)
+            foreach (var header in context.Request.Headers)
             {
-                if (header.Key.ToLower() != "authorization") // Don't log full auth header
+                if (header.Key.ToLower() != "authorization")
                 {
-                    Console.WriteLine($"{CYAN}     {header.Key}: {string.Join(", ", header.Value)}{RESET}");
+                    Console.WriteLine($"{CYAN}     {header.Key}: {string.Join(", ", header.Value.ToArray())}{RESET}");
                 }
             }
         }
@@ -423,10 +471,9 @@ public class McpFunctions
             Console.WriteLine($"{MAGENTA}   Tool: {toolName}{RESET}");
     }
 
-    private object GenerateToolsListResponse(int? requestId, HttpRequestData req)
+    private object GenerateToolsListResponse(int? requestId, HttpContext context)
     {
-        // Check if backend auth exists for the caller's proxy token
-        var proxyToken = ExtractBearerToken(req);
+        var proxyToken = ExtractBearerToken(context);
         var hasBackendAuth = proxyToken != null && _backendAuthStore.ContainsKey(proxyToken);
         
         if (VerboseLogging)
@@ -545,9 +592,9 @@ public class McpFunctions
         };
     }
 
-    private object GenerateToolCallResponse(string? toolName, JsonElement? arguments, int? requestId, HttpRequestData req)
+    private object GenerateToolCallResponse(string? toolName, JsonElement? arguments, int? requestId, HttpContext context)
     {
-        var proxyToken = ExtractBearerToken(req);
+        var proxyToken = ExtractBearerToken(context);
         var hasBackendAuth = proxyToken != null && _backendAuthStore.TryGetValue(proxyToken, out var backendRecord);
 
         // discover_tools always triggers the backend auth flow if not yet authenticated
@@ -586,9 +633,8 @@ public class McpFunctions
 
             // Return elicitation with backend auth URL
             Console.WriteLine($"{YELLOW}   ⚠ Backend auth required - returning elicitation{RESET}");
-            var baseUrl = GetBaseUrl(req);
+            var baseUrl = GetBaseUrl(context);
             
-            // Generate a short-lived session ID instead of putting the raw proxy token in the URL
             var sessionId = Guid.NewGuid().ToString("N")[..16];
             _backendAuthPending[sessionId] = new BackendAuthPending(proxyToken!, sessionId, DateTime.UtcNow);
             var backendAuthUrl = $"{baseUrl}/backend-auth/login?session={Uri.EscapeDataString(sessionId)}";
@@ -625,7 +671,7 @@ public class McpFunctions
         if (!hasBackendAuth)
         {
             Console.WriteLine($"{YELLOW}   ⚠ Backend auth required for tool: {toolName}{RESET}");
-            var baseUrl = GetBaseUrl(req);
+            var baseUrl = GetBaseUrl(context);
             var sessionId2 = Guid.NewGuid().ToString("N")[..16];
             _backendAuthPending[sessionId2] = new BackendAuthPending(proxyToken!, sessionId2, DateTime.UtcNow);
             var backendAuthUrl = $"{baseUrl}/backend-auth/login?session={Uri.EscapeDataString(sessionId2)}";
@@ -704,7 +750,6 @@ public class McpFunctions
             location = locationElement.GetString() ?? "Unknown";
         }
         
-        // Return mock weather data
         return $"Weather for {location}: Sunny, 72°F (22°C), Humidity: 45%, Wind: 10 mph NW. (This is mock data)";
     }
 
@@ -716,18 +761,15 @@ public class McpFunctions
             expression = exprElement.GetString() ?? "unknown";
         }
         
-        // Always return 42 as a joke
         return $"The result of '{expression}' is 42. (This is mock data - the answer to everything!)";
     }
 
     /// <summary>
     /// Validates the bearer token from the Authorization header.
-    /// First checks the in-memory token store (proxy-issued tokens),
-    /// then falls back to JWT validation for backward compatibility.
     /// </summary>
-    private (bool IsValid, string? Error) ValidateBearerToken(HttpRequestData req)
+    private (bool IsValid, string? Error) ValidateBearerToken(HttpContext context)
     {
-        if (!req.Headers.TryGetValues("Authorization", out var authValues))
+        if (!context.Request.Headers.TryGetValue("Authorization", out var authValues))
             return (false, "Missing Authorization header");
 
         var authHeader = authValues.FirstOrDefault();
@@ -781,13 +823,13 @@ public class McpFunctions
     /// <summary>
     /// Creates a 401 Unauthorized response with WWW-Authenticate header pointing to PRM.
     /// </summary>
-    private async Task<HttpResponseData> CreateUnauthorizedResponse(HttpRequestData req, string errorDescription)
+    private async Task WriteUnauthorizedResponse(HttpContext context, string errorDescription)
     {
-        var response = req.CreateResponse(System.Net.HttpStatusCode.Unauthorized);
-        response.Headers.Add("Content-Type", "application/json");
+        context.Response.StatusCode = 401;
+        context.Response.Headers["Content-Type"] = "application/json";
         
-        var baseUrl = GetBaseUrl(req);
-        response.Headers.Add("WWW-Authenticate", $"Bearer resource_metadata=\"{baseUrl}/.well-known/oauth-protected-resource\"");
+        var baseUrl = GetBaseUrl(context);
+        context.Response.Headers["WWW-Authenticate"] = $"Bearer resource_metadata=\"{baseUrl}/.well-known/oauth-protected-resource\"";
 
         var responseBody = new
         {
@@ -795,27 +837,25 @@ public class McpFunctions
             error_description = errorDescription
         };
 
-        await response.WriteStringAsync(JsonSerializer.Serialize(responseBody, new JsonSerializerOptions 
+        await context.Response.WriteAsync(JsonSerializer.Serialize(responseBody, new JsonSerializerOptions 
         { 
             WriteIndented = true 
         }));
 
         LogResponse("POST /mcp", 401, errorDescription);
-        return response;
     }
 
-    private static string GetBaseUrl(HttpRequestData req)
+    private static string GetBaseUrl(HttpContext context)
     {
-        var port = req.Url.Port;
-        var defaultPort = req.Url.Scheme == "https" ? 443 : 80;
-        return port == defaultPort
-            ? $"{req.Url.Scheme}://{req.Url.Host}"
-            : $"{req.Url.Scheme}://{req.Url.Host}:{port}";
+        var request = context.Request;
+        var host = request.Host;
+        // Host includes port when non-default
+        return $"{request.Scheme}://{host}";
     }
 
-    private static string? ExtractBearerToken(HttpRequestData req)
+    private static string? ExtractBearerToken(HttpContext context)
     {
-        if (!req.Headers.TryGetValues("Authorization", out var authValues))
+        if (!context.Request.Headers.TryGetValue("Authorization", out var authValues))
             return null;
         var authHeader = authValues.FirstOrDefault();
         if (authHeader?.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase) == true)
@@ -827,25 +867,19 @@ public class McpFunctions
 
     /// <summary>
     /// GET /backend-auth/login - Starts OAuth2 flow against AAD App #2.
-    /// The proxy_token query param links this auth to the caller's session.
-    /// Mock mode: auto-approves without Entra redirect.
-    /// Entra mode: redirects to Entra ID for App #2 login.
     /// </summary>
-    [Function("BackendAuthLogin")]
-    public async Task<HttpResponseData> BackendAuthLogin(
-        [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "backend-auth/login")] HttpRequestData req)
+    public async Task HandleBackendAuthLogin(HttpContext context)
     {
-        await LogRequestDetails(req, "GET");
+        await LogRequestDetails(context, "GET");
 
-        var query = System.Web.HttpUtility.ParseQueryString(req.Url.Query);
+        var query = context.Request.Query;
         
         // Accept either session ID (new) or proxy_token (legacy)
-        var sessionId = query["session"];
+        var sessionId = query["session"].FirstOrDefault();
         string? proxyToken = null;
         
         if (!string.IsNullOrEmpty(sessionId))
         {
-            // Look up the proxy token from the pending session
             if (_backendAuthPending.TryGetValue(sessionId, out var pendingSession))
             {
                 proxyToken = pendingSession.ProxyToken;
@@ -853,24 +887,24 @@ public class McpFunctions
             }
             else
             {
-                var errorResponse = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
-                errorResponse.Headers.Add("Content-Type", "text/html");
-                await errorResponse.WriteStringAsync("<html><body><h1>Error</h1><p>Invalid or expired session. Please retry the tool call to get a new authorization link.</p></body></html>");
-                return errorResponse;
+                context.Response.StatusCode = 400;
+                context.Response.Headers["Content-Type"] = "text/html";
+                await context.Response.WriteAsync("<html><body><h1>Error</h1><p>Invalid or expired session. Please retry the tool call to get a new authorization link.</p></body></html>");
+                return;
             }
         }
         else
         {
             // Legacy: accept proxy_token directly
-            proxyToken = query["proxy_token"];
+            proxyToken = query["proxy_token"].FirstOrDefault();
         }
 
         if (string.IsNullOrEmpty(proxyToken))
         {
-            var errorResponse = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
-            errorResponse.Headers.Add("Content-Type", "text/html");
-            await errorResponse.WriteStringAsync("<html><body><h1>Error</h1><p>Missing proxy_token parameter</p></body></html>");
-            return errorResponse;
+            context.Response.StatusCode = 400;
+            context.Response.Headers["Content-Type"] = "text/html";
+            await context.Response.WriteAsync("<html><body><h1>Error</h1><p>Missing proxy_token parameter</p></body></html>");
+            return;
         }
 
         Console.WriteLine($"{MAGENTA}   ⚡ Backend auth login for proxy token: {proxyToken[..Math.Min(8, proxyToken.Length)]}...{RESET}");
@@ -879,7 +913,7 @@ public class McpFunctions
         {
             // Entra mode: redirect to Entra ID for App #2
             var state = Guid.NewGuid().ToString("N");
-            var baseUrl = GetBaseUrl(req);
+            var baseUrl = GetBaseUrl(context);
             var callbackUri = $"{baseUrl}/backend-auth/callback";
 
             _backendAuthPending[state] = new BackendAuthPending(proxyToken, state, DateTime.UtcNow);
@@ -892,10 +926,9 @@ public class McpFunctions
                 $"&state={Uri.EscapeDataString(state)}";
 
             Console.WriteLine($"{CYAN}   → Redirecting to Entra ID (App #2){RESET}");
-            var response = req.CreateResponse(System.Net.HttpStatusCode.Redirect);
-            response.Headers.Add("Location", entraAuthUrl);
+            context.Response.StatusCode = 302;
+            context.Response.Headers["Location"] = entraAuthUrl;
             LogResponse("GET /backend-auth/login", 302, "→ Entra ID (App #2)");
-            return response;
         }
         else
         {
@@ -906,9 +939,12 @@ public class McpFunctions
 
             Console.WriteLine($"{GREEN}   ✓ Mock backend auth granted{RESET}");
 
-            var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
-            response.Headers.Add("Content-Type", "text/html");
-            await response.WriteStringAsync(@"
+            // Notify SSE clients that tools have changed
+            await NotifyToolsChanged(proxyToken);
+
+            context.Response.StatusCode = 200;
+            context.Response.Headers["Content-Type"] = "text/html";
+            await context.Response.WriteAsync(@"
 <!DOCTYPE html>
 <html>
 <head><title>Backend Authorization Complete</title>
@@ -928,53 +964,49 @@ public class McpFunctions
 </body>
 </html>");
             LogResponse("GET /backend-auth/login", 200, "Mock backend auth granted");
-            return response;
         }
     }
 
     /// <summary>
     /// GET /backend-auth/callback - Entra ID callback for AAD App #2.
-    /// Exchanges Entra code for backend tokens and stores them server-side.
     /// </summary>
-    [Function("BackendAuthCallback")]
-    public async Task<HttpResponseData> BackendAuthCallback(
-        [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "backend-auth/callback")] HttpRequestData req)
+    public async Task HandleBackendAuthCallback(HttpContext context)
     {
-        await LogRequestDetails(req, "GET");
+        await LogRequestDetails(context, "GET");
 
-        var query = System.Web.HttpUtility.ParseQueryString(req.Url.Query);
-        var entraCode = query["code"];
-        var state = query["state"];
-        var error = query["error"];
+        var query = context.Request.Query;
+        var entraCode = query["code"].FirstOrDefault();
+        var state = query["state"].FirstOrDefault();
+        var error = query["error"].FirstOrDefault();
 
         if (!string.IsNullOrEmpty(error))
         {
             Console.WriteLine($"{RED}   ✗ Entra App #2 returned error: {error}{RESET}");
-            var errorResponse = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
-            errorResponse.Headers.Add("Content-Type", "text/html");
-            await errorResponse.WriteStringAsync($"<html><body><h1>Error</h1><p>{error}: {query["error_description"]}</p></body></html>");
-            return errorResponse;
+            context.Response.StatusCode = 400;
+            context.Response.Headers["Content-Type"] = "text/html";
+            await context.Response.WriteAsync($"<html><body><h1>Error</h1><p>{error}: {query["error_description"].FirstOrDefault()}</p></body></html>");
+            return;
         }
 
         if (string.IsNullOrEmpty(entraCode) || string.IsNullOrEmpty(state))
         {
-            var errorResponse = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
-            errorResponse.Headers.Add("Content-Type", "text/html");
-            await errorResponse.WriteStringAsync("<html><body><h1>Error</h1><p>Missing code or state</p></body></html>");
-            return errorResponse;
+            context.Response.StatusCode = 400;
+            context.Response.Headers["Content-Type"] = "text/html";
+            await context.Response.WriteAsync("<html><body><h1>Error</h1><p>Missing code or state</p></body></html>");
+            return;
         }
 
         if (!_backendAuthPending.TryRemove(state, out var pending))
         {
-            var errorResponse = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
-            errorResponse.Headers.Add("Content-Type", "text/html");
-            await errorResponse.WriteStringAsync("<html><body><h1>Error</h1><p>Unknown state — session expired or already used</p></body></html>");
-            return errorResponse;
+            context.Response.StatusCode = 400;
+            context.Response.Headers["Content-Type"] = "text/html";
+            await context.Response.WriteAsync("<html><body><h1>Error</h1><p>Unknown state — session expired or already used</p></body></html>");
+            return;
         }
 
         Console.WriteLine($"{CYAN}   Exchanging Entra code for backend tokens (App #2)...{RESET}");
 
-        var baseUrl = GetBaseUrl(req);
+        var baseUrl = GetBaseUrl(context);
         var callbackUri = $"{baseUrl}/backend-auth/callback";
 
         var tokenRequestContent = new FormUrlEncodedContent(new Dictionary<string, string>
@@ -998,10 +1030,10 @@ public class McpFunctions
             if (!tokenResponse.IsSuccessStatusCode)
             {
                 Console.WriteLine($"{RED}   ✗ Backend token exchange failed: {tokenBody}{RESET}");
-                var errorResponse = req.CreateResponse(System.Net.HttpStatusCode.InternalServerError);
-                errorResponse.Headers.Add("Content-Type", "text/html");
-                await errorResponse.WriteStringAsync("<html><body><h1>Error</h1><p>Failed to exchange code for backend tokens.</p></body></html>");
-                return errorResponse;
+                context.Response.StatusCode = 500;
+                context.Response.Headers["Content-Type"] = "text/html";
+                await context.Response.WriteAsync("<html><body><h1>Error</h1><p>Failed to exchange code for backend tokens.</p></body></html>");
+                return;
             }
 
             using var tokenJson = JsonDocument.Parse(tokenBody);
@@ -1015,9 +1047,12 @@ public class McpFunctions
 
             Console.WriteLine($"{GREEN}   ✓ Backend tokens stored for proxy token: {pending.ProxyToken[..Math.Min(8, pending.ProxyToken.Length)]}...{RESET}");
 
-            var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
-            response.Headers.Add("Content-Type", "text/html");
-            await response.WriteStringAsync(@"
+            // Notify SSE clients that tools have changed
+            await NotifyToolsChanged(pending.ProxyToken);
+
+            context.Response.StatusCode = 200;
+            context.Response.Headers["Content-Type"] = "text/html";
+            await context.Response.WriteAsync(@"
 <!DOCTYPE html>
 <html>
 <head><title>Backend Authorization Complete</title>
@@ -1038,73 +1073,64 @@ public class McpFunctions
 </body>
 </html>");
             LogResponse("GET /backend-auth/callback", 200, "Backend tokens stored");
-            return response;
         }
         catch (Exception ex)
         {
             Console.WriteLine($"{RED}   ✗ Backend token exchange error: {ex.Message}{RESET}");
-            var errorResponse = req.CreateResponse(System.Net.HttpStatusCode.InternalServerError);
-            errorResponse.Headers.Add("Content-Type", "text/html");
-            await errorResponse.WriteStringAsync($"<html><body><h1>Error</h1><p>Token exchange failed: {ex.Message}</p></body></html>");
-            return errorResponse;
+            context.Response.StatusCode = 500;
+            context.Response.Headers["Content-Type"] = "text/html";
+            await context.Response.WriteAsync($"<html><body><h1>Error</h1><p>Token exchange failed: {ex.Message}</p></body></html>");
         }
     }
 
     /// <summary>
     /// GET /backend-auth/status - Check backend auth status for a proxy token.
     /// </summary>
-    [Function("BackendAuthStatus")]
-    public async Task<HttpResponseData> BackendAuthStatus(
-        [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "backend-auth/status")] HttpRequestData req)
+    public async Task HandleBackendAuthStatus(HttpContext context)
     {
-        var query = System.Web.HttpUtility.ParseQueryString(req.Url.Query);
-        var proxyToken = query["proxy_token"];
+        var query = context.Request.Query;
+        var proxyToken = query["proxy_token"].FirstOrDefault();
 
-        var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
-        response.Headers.Add("Content-Type", "application/json");
+        context.Response.StatusCode = 200;
+        context.Response.Headers["Content-Type"] = "application/json";
 
         var isAuthorized = !string.IsNullOrEmpty(proxyToken) && _backendAuthStore.ContainsKey(proxyToken);
 
-        await response.WriteStringAsync(JsonSerializer.Serialize(new
+        await context.Response.WriteAsync(JsonSerializer.Serialize(new
         {
             authorized = isAuthorized,
             proxy_token = proxyToken?[..Math.Min(8, proxyToken?.Length ?? 0)] + "..."
         }, new JsonSerializerOptions { WriteIndented = true }));
-
-        return response;
     }
 
     // ── OAuth / CIMD Endpoints ──────────────────────────────────────────
 
     /// <summary>
     /// GET /oauth/authorize - OAuth Authorization Endpoint (CIMD)
-    /// Accepts client_id as a URL to a CIMD metadata document.
-    /// Mock mode: generates auth code directly.
-    /// Entra mode: redirects to Entra ID for user authentication.
     /// </summary>
-    [Function("OAuthAuthorize")]
-    public async Task<HttpResponseData> OAuthAuthorize(
-        [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "oauth/authorize")] HttpRequestData req)
+    public async Task HandleOAuthAuthorize(HttpContext context)
     {
-        await LogRequestDetails(req, "GET");
+        await LogRequestDetails(context, "GET");
 
-        var query = System.Web.HttpUtility.ParseQueryString(req.Url.Query);
-        var responseType = query["response_type"];
-        var clientId = query["client_id"];
-        var redirectUri = query["redirect_uri"];
-        var scope = query["scope"] ?? GetScopesSupported();
-        var state = query["state"] ?? "";
+        var query = context.Request.Query;
+        var responseType = query["response_type"].FirstOrDefault();
+        var clientId = query["client_id"].FirstOrDefault();
+        var redirectUri = query["redirect_uri"].FirstOrDefault();
+        var scope = query["scope"].FirstOrDefault() ?? GetScopesSupported();
+        var state = query["state"].FirstOrDefault() ?? "";
 
         Console.WriteLine($"{MAGENTA}   ⚡ OAuth Authorize: client_id={clientId}{RESET}");
 
         if (responseType != "code")
         {
-            return await CreateOAuthErrorResponse(req, "unsupported_response_type", "Only response_type=code is supported");
+            await WriteOAuthErrorResponse(context, "unsupported_response_type", "Only response_type=code is supported");
+            return;
         }
 
         if (string.IsNullOrEmpty(clientId) || string.IsNullOrEmpty(redirectUri))
         {
-            return await CreateOAuthErrorResponse(req, "invalid_request", "client_id and redirect_uri are required");
+            await WriteOAuthErrorResponse(context, "invalid_request", "client_id and redirect_uri are required");
+            return;
         }
 
         // Fetch and validate CIMD document
@@ -1112,23 +1138,23 @@ public class McpFunctions
         if (!cimdValid)
         {
             Console.WriteLine($"{RED}   ✗ CIMD validation failed: {cimdError}{RESET}");
-            return await CreateOAuthErrorResponse(req, "invalid_client", cimdError ?? "CIMD validation failed");
+            await WriteOAuthErrorResponse(context, "invalid_client", cimdError ?? "CIMD validation failed");
+            return;
         }
         Console.WriteLine($"{GREEN}   ✓ CIMD validated for {clientId}{RESET}");
 
         if (AuthMode == "entra")
         {
-            // Entra mode: redirect to Entra ID for authentication
             if (string.IsNullOrEmpty(AzureClientId))
             {
-                return await CreateOAuthErrorResponse(req, "server_error", "AZURE_CLIENT_ID not configured");
+                await WriteOAuthErrorResponse(context, "server_error", "AZURE_CLIENT_ID not configured");
+                return;
             }
 
             var proxyState = Guid.NewGuid().ToString("N");
-            var baseUrl = GetBaseUrl(req);
+            var baseUrl = GetBaseUrl(context);
             var callbackUri = $"{baseUrl}/oauth/callback";
 
-            // Store session for callback
             _authSessions[proxyState] = new AuthSession(
                 clientId, redirectUri, scope, state,
                 EntraState: proxyState, CodeVerifier: null,
@@ -1142,10 +1168,9 @@ public class McpFunctions
                 $"&state={Uri.EscapeDataString(proxyState)}";
 
             Console.WriteLine($"{CYAN}   → Redirecting to Entra ID{RESET}");
-            var response = req.CreateResponse(System.Net.HttpStatusCode.Redirect);
-            response.Headers.Add("Location", entraAuthUrl);
+            context.Response.StatusCode = 302;
+            context.Response.Headers["Location"] = entraAuthUrl;
             LogResponse("GET /oauth/authorize", 302, "→ Entra ID");
-            return response;
         }
         else
         {
@@ -1159,48 +1184,46 @@ public class McpFunctions
             var location = $"{redirectUri}{(redirectUri.Contains('?') ? '&' : '?')}code={Uri.EscapeDataString(authCode)}&state={Uri.EscapeDataString(state)}";
             Console.WriteLine($"{GREEN}   ✓ Mock auth code issued: {authCode[..8]}...{RESET}");
 
-            var response = req.CreateResponse(System.Net.HttpStatusCode.Redirect);
-            response.Headers.Add("Location", location);
+            context.Response.StatusCode = 302;
+            context.Response.Headers["Location"] = location;
             LogResponse("GET /oauth/authorize", 302, $"→ {redirectUri}");
-            return response;
         }
     }
 
     /// <summary>
     /// GET /oauth/callback - Entra ID callback (Entra mode only)
-    /// Receives Entra auth code, exchanges for tokens, then redirects to client.
     /// </summary>
-    [Function("OAuthCallback")]
-    public async Task<HttpResponseData> OAuthCallback(
-        [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "oauth/callback")] HttpRequestData req)
+    public async Task HandleOAuthCallback(HttpContext context)
     {
-        await LogRequestDetails(req, "GET");
+        await LogRequestDetails(context, "GET");
 
-        var query = System.Web.HttpUtility.ParseQueryString(req.Url.Query);
-        var entraCode = query["code"];
-        var proxyState = query["state"];
-        var error = query["error"];
+        var query = context.Request.Query;
+        var entraCode = query["code"].FirstOrDefault();
+        var proxyState = query["state"].FirstOrDefault();
+        var error = query["error"].FirstOrDefault();
 
         if (!string.IsNullOrEmpty(error))
         {
             Console.WriteLine($"{RED}   ✗ Entra returned error: {error}{RESET}");
-            return await CreateOAuthErrorResponse(req, "access_denied", $"Entra error: {error} - {query["error_description"]}");
+            await WriteOAuthErrorResponse(context, "access_denied", $"Entra error: {error} - {query["error_description"].FirstOrDefault()}");
+            return;
         }
 
         if (string.IsNullOrEmpty(entraCode) || string.IsNullOrEmpty(proxyState))
         {
-            return await CreateOAuthErrorResponse(req, "invalid_request", "Missing code or state from Entra callback");
+            await WriteOAuthErrorResponse(context, "invalid_request", "Missing code or state from Entra callback");
+            return;
         }
 
         if (!_authSessions.TryGetValue(proxyState, out var session))
         {
-            return await CreateOAuthErrorResponse(req, "invalid_request", "Unknown state — session not found");
+            await WriteOAuthErrorResponse(context, "invalid_request", "Unknown state — session not found");
+            return;
         }
 
         Console.WriteLine($"{CYAN}   Exchanging Entra code for tokens...{RESET}");
 
-        // Exchange Entra auth code for tokens
-        var baseUrl = GetBaseUrl(req);
+        var baseUrl = GetBaseUrl(context);
         var callbackUri = $"{baseUrl}/oauth/callback";
 
         var tokenRequestContent = new FormUrlEncodedContent(new Dictionary<string, string>
@@ -1224,49 +1247,44 @@ public class McpFunctions
             if (!tokenResponse.IsSuccessStatusCode)
             {
                 Console.WriteLine($"{RED}   ✗ Entra token exchange failed: {tokenBody}{RESET}");
-                return await CreateOAuthErrorResponse(req, "server_error", "Failed to exchange Entra code for tokens");
+                await WriteOAuthErrorResponse(context, "server_error", "Failed to exchange Entra code for tokens");
+                return;
             }
 
             using var tokenJson = JsonDocument.Parse(tokenBody);
             var entraAccessToken = tokenJson.RootElement.GetProperty("access_token").GetString();
             Console.WriteLine($"{GREEN}   ✓ Entra tokens received{RESET}");
 
-            // Generate proxy auth code and update session
             var proxyCode = Guid.NewGuid().ToString("N");
             _authSessions[proxyCode] = session with
             {
                 AuthCode = proxyCode,
                 EntraAccessToken = entraAccessToken
             };
-            // Clean up the state-keyed session
             _authSessions.TryRemove(proxyState, out _);
 
             var location = $"{session.RedirectUri}{(session.RedirectUri.Contains('?') ? '&' : '?')}code={Uri.EscapeDataString(proxyCode)}&state={Uri.EscapeDataString(session.State)}";
             Console.WriteLine($"{GREEN}   ✓ Proxy auth code issued, redirecting to client{RESET}");
 
-            var response = req.CreateResponse(System.Net.HttpStatusCode.Redirect);
-            response.Headers.Add("Location", location);
+            context.Response.StatusCode = 302;
+            context.Response.Headers["Location"] = location;
             LogResponse("GET /oauth/callback", 302, $"→ {session.RedirectUri}");
-            return response;
         }
         catch (Exception ex)
         {
             Console.WriteLine($"{RED}   ✗ Entra token exchange error: {ex.Message}{RESET}");
-            return await CreateOAuthErrorResponse(req, "server_error", $"Token exchange failed: {ex.Message}");
+            await WriteOAuthErrorResponse(context, "server_error", $"Token exchange failed: {ex.Message}");
         }
     }
 
     /// <summary>
     /// POST /oauth/token - OAuth Token Endpoint
-    /// Exchanges proxy authorization code for an access token.
     /// </summary>
-    [Function("OAuthToken")]
-    public async Task<HttpResponseData> OAuthToken(
-        [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "oauth/token")] HttpRequestData req)
+    public async Task HandleOAuthToken(HttpContext context)
     {
-        await LogRequestDetails(req, "POST");
+        await LogRequestDetails(context, "POST");
 
-        var body = await new StreamReader(req.Body).ReadToEndAsync();
+        var body = await new StreamReader(context.Request.Body).ReadToEndAsync();
         var form = System.Web.HttpUtility.ParseQueryString(body);
         var grantType = form["grant_type"];
         var code = form["code"];
@@ -1276,27 +1294,32 @@ public class McpFunctions
 
         if (grantType != "authorization_code")
         {
-            return await CreateOAuthTokenErrorResponse(req, "unsupported_grant_type", "Only authorization_code is supported");
+            await WriteOAuthTokenErrorResponse(context, "unsupported_grant_type", "Only authorization_code is supported");
+            return;
         }
 
         if (string.IsNullOrEmpty(code) || string.IsNullOrEmpty(clientId))
         {
-            return await CreateOAuthTokenErrorResponse(req, "invalid_request", "code and client_id are required");
+            await WriteOAuthTokenErrorResponse(context, "invalid_request", "code and client_id are required");
+            return;
         }
 
         if (!_authSessions.TryGetValue(code, out var session))
         {
-            return await CreateOAuthTokenErrorResponse(req, "invalid_grant", "Authorization code not found or expired");
+            await WriteOAuthTokenErrorResponse(context, "invalid_grant", "Authorization code not found or expired");
+            return;
         }
 
         if (session.IsRedeemed)
         {
-            return await CreateOAuthTokenErrorResponse(req, "invalid_grant", "Authorization code has already been used");
+            await WriteOAuthTokenErrorResponse(context, "invalid_grant", "Authorization code has already been used");
+            return;
         }
 
         if (session.ClientId != clientId)
         {
-            return await CreateOAuthTokenErrorResponse(req, "invalid_grant", "client_id does not match the authorization request");
+            await WriteOAuthTokenErrorResponse(context, "invalid_grant", "client_id does not match the authorization request");
+            return;
         }
 
         // Mark code as redeemed
@@ -1310,11 +1333,11 @@ public class McpFunctions
 
         Console.WriteLine($"{GREEN}   ✓ Access token issued for {clientId}{RESET}");
 
-        var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
-        response.Headers.Add("Content-Type", "application/json");
-        response.Headers.Add("Cache-Control", "no-store");
+        context.Response.StatusCode = 200;
+        context.Response.Headers["Content-Type"] = "application/json";
+        context.Response.Headers["Cache-Control"] = "no-store";
 
-        var tokenResponse = new
+        var tokenResponseBody = new
         {
             access_token = accessToken,
             token_type = "Bearer",
@@ -1322,26 +1345,23 @@ public class McpFunctions
             scope = session.Scope
         };
 
-        await response.WriteStringAsync(JsonSerializer.Serialize(tokenResponse, new JsonSerializerOptions
+        await context.Response.WriteAsync(JsonSerializer.Serialize(tokenResponseBody, new JsonSerializerOptions
         {
             WriteIndented = true
         }));
 
         LogResponse("POST /oauth/token", 200, $"token issued for {clientId}");
-        return response;
     }
 
     // ── CIMD Validation ─────────────────────────────────────────────────
 
     private async Task<(bool IsValid, string? Error)> ValidateCimd(string clientId, string redirectUri)
     {
-        // client_id must be a valid URL
         if (!Uri.TryCreate(clientId, UriKind.Absolute, out var clientIdUri))
         {
             return (false, "client_id is not a valid URL");
         }
 
-        // Require HTTPS unless localhost (allow http for local development)
         var isLocalhost = clientIdUri.Host is "localhost" or "127.0.0.1" or "::1";
         if (clientIdUri.Scheme != "https" && !isLocalhost)
         {
@@ -1362,7 +1382,6 @@ public class McpFunctions
             using var doc = JsonDocument.Parse(content);
             var root = doc.RootElement;
 
-            // Validate client_id matches
             if (root.TryGetProperty("client_id", out var cidProp))
             {
                 var docClientId = cidProp.GetString();
@@ -1376,7 +1395,6 @@ public class McpFunctions
                 return (false, "CIMD document missing client_id field");
             }
 
-            // Validate redirect_uri is listed
             if (root.TryGetProperty("redirect_uris", out var redirectUrisProp) && redirectUrisProp.ValueKind == JsonValueKind.Array)
             {
                 var allowedUris = redirectUrisProp.EnumerateArray()
@@ -1384,13 +1402,10 @@ public class McpFunctions
                     .Where(u => u != null)
                     .ToList();
 
-                // Per RFC 8252 Section 7.3, for loopback redirects the port must be
-                // excluded from the redirect_uri comparison (native apps use dynamic ports).
                 bool redirectMatch = false;
                 if (Uri.TryCreate(redirectUri, UriKind.Absolute, out var reqRedirectUri)
                     && (reqRedirectUri.Host is "127.0.0.1" or "localhost" or "::1"))
                 {
-                    // Loopback: match scheme + host + path, ignore port
                     redirectMatch = allowedUris.Any(u =>
                     {
                         if (Uri.TryCreate(u, UriKind.Absolute, out var allowedUri))
@@ -1435,24 +1450,23 @@ public class McpFunctions
         }
     }
 
-    private async Task<HttpResponseData> CreateOAuthErrorResponse(HttpRequestData req, string error, string description)
+    private async Task WriteOAuthErrorResponse(HttpContext context, string error, string description)
     {
-        var response = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
-        response.Headers.Add("Content-Type", "application/json");
-        await response.WriteStringAsync(JsonSerializer.Serialize(new { error, error_description = description },
+        context.Response.StatusCode = 400;
+        context.Response.Headers["Content-Type"] = "application/json";
+        await context.Response.WriteAsync(JsonSerializer.Serialize(new { error, error_description = description },
             new JsonSerializerOptions { WriteIndented = true }));
-        LogResponse(req.Url.AbsolutePath, 400, description);
-        return response;
+        var path = context.Request.Path.Value ?? "";
+        LogResponse(path, 400, description);
     }
 
-    private async Task<HttpResponseData> CreateOAuthTokenErrorResponse(HttpRequestData req, string error, string description)
+    private async Task WriteOAuthTokenErrorResponse(HttpContext context, string error, string description)
     {
-        var response = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
-        response.Headers.Add("Content-Type", "application/json");
-        response.Headers.Add("Cache-Control", "no-store");
-        await response.WriteStringAsync(JsonSerializer.Serialize(new { error, error_description = description },
+        context.Response.StatusCode = 400;
+        context.Response.Headers["Content-Type"] = "application/json";
+        context.Response.Headers["Cache-Control"] = "no-store";
+        await context.Response.WriteAsync(JsonSerializer.Serialize(new { error, error_description = description },
             new JsonSerializerOptions { WriteIndented = true }));
         LogResponse("POST /oauth/token", 400, description);
-        return response;
     }
 }
