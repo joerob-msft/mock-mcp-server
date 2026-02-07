@@ -1,0 +1,128 @@
+### ProtectedResourceMetadata
+GET http://localhost:7071/.well-known/oauth-protected-resource
+
+###
+
+### ProtectedResourceMetadata (mcp path)
+GET http://localhost:7071/.well-known/oauth-protected-resource/mcp
+
+###
+
+### OAuthAuthorizationServerMetadata
+GET http://localhost:7071/.well-known/oauth-authorization-server
+
+###
+
+### Step 0 - Unauthenticated tool call (expect 401)
+POST http://localhost:7071/mcp
+Content-Type: application/json
+
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "echo",
+    "arguments": { "message": "hello" }
+  }
+}
+
+###
+
+### Step 2 - OAuth Authorize (CIMD)
+GET http://localhost:7071/oauth/authorize?response_type=code&client_id=https://client.example.dev/oauth/metadata.json&redirect_uri=https://client.example.dev/oauth/callback&scope=mcp.tools.execute&state=test123
+
+###
+
+### Step 6 - Token Exchange
+# Replace <AUTH_CODE> with the code from the authorize redirect
+POST http://localhost:7071/oauth/token
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=authorization_code&code=<AUTH_CODE>&client_id=https://client.example.dev/oauth/metadata.json
+
+###
+
+### Initialize (no auth required)
+POST http://localhost:7071/mcp
+Content-Type: application/json
+
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "initialize",
+  "params": {}
+}
+
+###
+
+### Tools List (returns discover_tools only before backend auth)
+POST http://localhost:7071/mcp
+Content-Type: application/json
+Authorization: Bearer <ACCESS_TOKEN>
+
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/list",
+  "params": {}
+}
+
+###
+
+### Call discover_tools (returns elicitation URL for backend auth)
+POST http://localhost:7071/mcp
+Content-Type: application/json
+Authorization: Bearer <ACCESS_TOKEN>
+
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tools/call",
+  "params": {
+    "name": "discover_tools",
+    "arguments": {}
+  }
+}
+
+###
+
+### Backend Auth Login (open in browser - mock mode auto-approves)
+# Replace <ACCESS_TOKEN> with your proxy token
+GET http://localhost:7071/backend-auth/login?proxy_token=<ACCESS_TOKEN>
+
+###
+
+### Backend Auth Status
+GET http://localhost:7071/backend-auth/status?proxy_token=<ACCESS_TOKEN>
+
+###
+
+### Tools List (returns full list after backend auth)
+POST http://localhost:7071/mcp
+Content-Type: application/json
+Authorization: Bearer <ACCESS_TOKEN>
+
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "method": "tools/list",
+  "params": {}
+}
+
+###
+
+### Call echo tool (requires both proxy token + backend auth)
+POST http://localhost:7071/mcp
+Content-Type: application/json
+Authorization: Bearer <ACCESS_TOKEN>
+
+{
+  "jsonrpc": "2.0",
+  "id": 5,
+  "method": "tools/call",
+  "params": {
+    "name": "echo",
+    "arguments": { "message": "hello world" }
+  }
+}

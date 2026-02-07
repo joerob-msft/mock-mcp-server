@@ -1,24 +1,115 @@
 # Mock MCP Server - Azure Functions
 
-A simple MCP (Model Context Protocol) server hosted on Azure Functions using .NET 8.
+A mock MCP (Model Context Protocol) proxy server with two-part authentication, built as a .NET 8 Azure Functions app. Models a real-world architecture where an MCP proxy authenticates clients via CIMD (AAD App #1) and internally authenticates to a backend MCP server via a separate AAD app (App #2).
+
+## Two-Part Authentication Flow
+
+```
+VS Code (MCP Client)
+  │
+  ├─ CIMD OAuth ──→ AAD App #1 ──→ proxy token
+  │
+  ├─ tools/list ──→ [discover_tools only]
+  │
+  ├─ tools/call discover_tools ──→ elicitation URL
+  │       │
+  │       └─ User opens browser → /backend-auth/login
+  │             → Entra login (AAD App #2)
+  │             → Backend tokens stored server-side
+  │             → "Success, close window"
+  │
+  ├─ tools/list ──→ [full tools list]
+  │
+  └─ tools/call echo ──→ proxy uses stored backend token internally
+```
+
+### Part 1: Proxy Auth (CIMD + AAD App #1)
+1. Client discovers PRM at `/.well-known/oauth-protected-resource`
+2. Client authenticates via CIMD OAuth flow (`/oauth/authorize` → `/oauth/token`)
+3. Client receives a **proxy token** — this is the only token the client ever sees
+4. With proxy token, `tools/list` returns only `discover_tools`
+
+### Part 2: Backend Auth (AAD App #2, server-side)
+5. Client calls `discover_tools` → receives elicitation URL
+6. User opens URL in browser → authenticates against AAD App #2
+7. Backend tokens (access + refresh) stored **server-side**, keyed by proxy token
+8. Now `tools/list` returns full tools and `tools/call` works
+9. Client continues using the same proxy token — backend tokens are never exposed
 
 ## Endpoints
 
 | Method | Route | Description |
 |--------|-------|-------------|
-| GET | `/api/mcp` | Returns server capabilities |
-| POST | `/api/mcp` | Handles MCP JSON-RPC requests |
-
-Both endpoints are unauthenticated and include comprehensive request logging.
+| GET | `/.well-known/oauth-protected-resource` | Protected Resource Metadata (PRM) |
+| GET | `/.well-known/oauth-authorization-server` | OAuth Authorization Server Metadata |
+| GET | `/oauth/authorize` | OAuth authorization endpoint (CIMD) |
+| GET | `/oauth/callback` | Entra ID callback (proxy auth) |
+| POST | `/oauth/token` | OAuth token endpoint (proxy auth) |
+| GET/POST | `/mcp` | MCP JSON-RPC endpoint |
+| GET | `/backend-auth/login` | Start backend auth (AAD App #2) |
+| GET | `/backend-auth/callback` | Backend auth callback |
+| GET | `/backend-auth/status` | Check backend auth status |
 
 ## Supported MCP Methods
 
-The POST endpoint handles the following MCP methods:
 - `initialize` - Returns server capabilities
-- `tools/list` - Returns available tools (includes an "echo" tool)
-- `tools/call` - Executes a tool call
+- `tools/list` - Returns available tools (expands after consent)
+- `tools/call` - Executes a tool call (echo, get_weather, calculate)
 - `resources/list` - Returns available resources (empty)
 - `prompts/list` - Returns available prompts (empty)
+
+## Configuration
+
+### Auth Modes
+
+Set `MCP_AUTH_MODE` in `local.settings.json`:
+
+| Mode | Description |
+|------|-------------|
+| `mock` (default) | No external calls. Auth codes and tokens generated locally. Good for offline testing. |
+| `entra` | Real Azure AD integration. Redirects to Entra ID for user authentication. Requires AAD app registration. |
+
+### Environment Variables
+
+#### Proxy Auth (AAD App #1 — CIMD)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MCP_AUTH_MODE` | `mock` | Auth mode: `mock` or `entra` |
+| `AZURE_TENANT_ID` | `common` | Entra tenant ID |
+| `AZURE_CLIENT_ID` | — | AAD App #1 client ID (proxy) |
+| `AZURE_CLIENT_SECRET` | — | AAD App #1 client secret |
+
+#### Backend Auth (AAD App #2 — real MCP server)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BACKEND_CLIENT_ID` | — | AAD App #2 client ID (backend) |
+| `BACKEND_CLIENT_SECRET` | — | AAD App #2 client secret |
+| `BACKEND_TENANT_ID` | `AZURE_TENANT_ID` | Backend tenant (defaults to proxy tenant) |
+| `BACKEND_SCOPES` | `openid profile offline_access` | Scopes for App #2 |
+
+#### Other
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MCP_VERBOSE_LOGGING` | `false` | Enable verbose request/response logging |
+
+### Entra Mode Setup
+
+1. **App #1 (Proxy):** Register in Azure Portal, add redirect URI `http://localhost:7071/oauth/callback`
+2. **App #2 (Backend):** Register separately, add redirect URI `http://localhost:7071/backend-auth/callback`
+3. Set environment variables in `local.settings.json`:
+   ```json
+   {
+     "Values": {
+       "MCP_AUTH_MODE": "entra",
+       "AZURE_TENANT_ID": "your-tenant-id",
+       "AZURE_CLIENT_ID": "app1-client-id",
+       "AZURE_CLIENT_SECRET": "app1-secret",
+       "BACKEND_CLIENT_ID": "app2-client-id",
+       "BACKEND_CLIENT_SECRET": "app2-secret",
+       "BACKEND_SCOPES": "api://app2-client-id/.default"
+     }
+   }
+   ```
 
 ## Local Development
 
@@ -30,166 +121,48 @@ The POST endpoint handles the following MCP methods:
 
 ### Running Locally
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/your-username/mock-mcp-server.git
-   cd mock-mcp-server
-   ```
-
-2. Restore dependencies:
-   ```bash
-   dotnet restore
-   ```
-
-3. Start the function app:
-   ```bash
-   func start
-   ```
-
-4. Test the endpoints:
-   ```bash
-   # GET request
-   curl http://localhost:7071/api/mcp
-
-   # POST request (initialize)
-   curl -X POST http://localhost:7071/api/mcp \
-     -H "Content-Type: application/json" \
-     -d '{"jsonrpc":"2.0","method":"initialize","params":{},"id":1}'
-   ```
-
-## Deploy to Azure
-
-### Option 1: GitHub Actions (Recommended)
-
-1. **Create Azure Resources:**
-   - Create a new Function App in the [Azure Portal](https://portal.azure.com)
-   - Select **.NET 8** as the runtime stack
-   - Select **Windows** or **Linux** as the operating system
-   - Choose a hosting plan (Consumption plan for cost-effective option)
-
-2. **Get Publish Profile:**
-   - Go to your Function App in Azure Portal
-   - Click **Get publish profile** in the Overview section
-   - Download the `.PublishSettings` file
-
-3. **Configure GitHub Secrets:**
-   - Go to your GitHub repository → Settings → Secrets and variables → Actions
-   - Add a new secret named `AZURE_FUNCTIONAPP_PUBLISH_PROFILE`
-   - Paste the entire contents of the `.PublishSettings` file
-
-4. **Update Workflow:**
-   - Edit `.github/workflows/azure-functions-deploy.yml`
-   - Update `AZURE_FUNCTIONAPP_NAME` with your Function App name
-
-5. **Deploy:**
-   - Push to the `main` branch or manually trigger the workflow
-   - The app will automatically build and deploy
-
-### Option 2: Azure Portal Deployment Center
-
-1. **Create Azure Resources** (same as Option 1)
-
-2. **Connect to GitHub:**
-   - Go to your Function App in Azure Portal
-   - Navigate to **Deployment Center** (under Deployment)
-   - Select **GitHub** as the source
-   - Authorize Azure to access your GitHub account
-   - Select your repository and branch
-   - Choose **GitHub Actions** as the build provider
-   - Review and save
-
-3. **Azure will automatically:**
-   - Create a GitHub Actions workflow in your repository
-   - Configure the publish profile secret
-   - Start the first deployment
-
-### Option 3: Manual Deployment (Azure CLI)
-
 ```bash
-# Login to Azure
-az login
-
-# Create a resource group
-az group create --name rg-mock-mcp --location eastus
-
-# Create a storage account
-az storage account create \
-  --name stmockmcp$(date +%s) \
-  --resource-group rg-mock-mcp \
-  --location eastus \
-  --sku Standard_LRS
-
-# Create a function app
-az functionapp create \
-  --name mock-mcp-server \
-  --resource-group rg-mock-mcp \
-  --consumption-plan-location eastus \
-  --runtime dotnet-isolated \
-  --runtime-version 8 \
-  --functions-version 4 \
-  --storage-account <storage-account-name>
-
-# Deploy
-func azure functionapp publish mock-mcp-server
+dotnet build MockMcpServer.csproj
+func start --no-build
 ```
 
-## Logging
+### Testing the CIMD Flow
 
-The server includes comprehensive logging for debugging:
+```bash
+# 1. Check Protected Resource Metadata
+curl http://localhost:7071/.well-known/oauth-protected-resource
 
-- **Request Details:** HTTP method, URL, headers, query parameters
-- **Connection Info:** Host, port, scheme
-- **Request Body:** Full JSON body for POST requests
-- **MCP Method Parsing:** Extracted method name and request ID
-- **Response Body:** Full JSON response being sent
+# 2. Check OAuth Authorization Server Metadata
+curl http://localhost:7071/.well-known/oauth-authorization-server
 
-### Viewing Logs
+# 3. Start authorization (opens redirect)
+curl -v "http://localhost:7071/oauth/authorize?response_type=code&client_id=https://client.example.dev/oauth/metadata.json&redirect_uri=https://client.example.dev/oauth/callback&scope=mcp.tools.execute&state=test123"
 
-**Local Development:**
-- Logs appear in the terminal where `func start` is running
+# 4. Exchange code for token
+curl -X POST http://localhost:7071/oauth/token \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=authorization_code&code=<AUTH_CODE>&client_id=https://client.example.dev/oauth/metadata.json"
 
-**Azure Portal:**
-- Go to your Function App → Monitor → Log stream
-- Or use Application Insights for advanced querying
-
-**Application Insights Query:**
-```kusto
-traces
-| where message contains "MCP"
-| order by timestamp desc
-| take 100
+# 5. Use token for MCP calls
+curl -X POST http://localhost:7071/mcp \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <ACCESS_TOKEN>" \
+  -d '{"jsonrpc":"2.0","method":"initialize","params":{},"id":1}'
 ```
 
 ## Project Structure
 
 ```
 mock-mcp-server/
-├── .github/
-│   └── workflows/
-│       └── azure-functions-deploy.yml  # GitHub Actions deployment
 ├── Functions/
-│   └── McpFunctions.cs                 # MCP endpoint handlers
-├── .gitignore
-├── host.json                           # Azure Functions host configuration
-├── local.settings.json                 # Local development settings
-├── MockMcpServer.csproj                # Project file
-├── Program.cs                          # Application entry point
+│   └── McpFunctions.cs       # All endpoints (MCP, OAuth, consent)
+├── host.json                  # Azure Functions host config (routePrefix: "")
+├── local.settings.json        # Local dev settings (auth mode, credentials)
+├── MockMcpServer.csproj       # Project file
+├── Program.cs                 # App entry point
+├── samplecalls.http           # HTTP test file for VS Code REST Client
 └── README.md
 ```
-
-## Configuration
-
-### host.json
-
-Controls logging levels and HTTP routing:
-- Route prefix: `/api` (endpoints are at `/api/mcp`)
-- Logging: Set to `Trace` for detailed logs
-
-### local.settings.json
-
-Local development settings (not deployed):
-- `AzureWebJobsStorage`: Storage connection (use Azurite locally)
-- `FUNCTIONS_WORKER_RUNTIME`: `dotnet-isolated`
 
 ## License
 
