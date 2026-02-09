@@ -1,6 +1,6 @@
-# Mock MCP Server - Azure Functions
+# Mock MCP Server
 
-A mock MCP (Model Context Protocol) proxy server with two-part authentication, built as a .NET 8 Azure Functions app. Models a real-world architecture where an MCP proxy authenticates clients via CIMD (AAD App #1) and internally authenticates to a backend MCP server via a separate AAD app (App #2).
+A mock MCP (Model Context Protocol) proxy server with two-part authentication, SSE notifications, and CIMD-based client identity. Built as a .NET 8 ASP.NET Core app. Models a real-world architecture where an MCP proxy authenticates clients via CIMD (AAD App #1) and internally authenticates to a backend MCP server via a separate AAD app (App #2).
 
 ## Two-Part Authentication Flow
 
@@ -49,6 +49,7 @@ VS Code (MCP Client)
 | GET | `/backend-auth/login` | Start backend auth (AAD App #2) |
 | GET | `/backend-auth/callback` | Backend auth callback |
 | GET | `/backend-auth/status` | Check backend auth status |
+| GET | `/cimd-policy` | Current CIMD policy configuration |
 
 ## Supported MCP Methods
 
@@ -91,6 +92,46 @@ Set `MCP_AUTH_MODE` in `local.settings.json`:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MCP_VERBOSE_LOGGING` | `false` | Enable verbose request/response logging |
+| `CIMD_POLICY_MODE` | `open` | CIMD client policy: `open`, `allowlist`, or `denylist` |
+| `CIMD_ALLOWED_CLIENTS` | — | Semicolon-delimited list of allowed CIMD client patterns (used when mode=`allowlist`) |
+| `CIMD_DENIED_CLIENTS` | — | Semicolon-delimited list of denied CIMD client patterns (used when mode=`denylist`) |
+
+### CIMD Client Policy
+
+Controls which MCP clients are permitted to authenticate via CIMD. The policy is evaluated **before** fetching the CIMD document (prevents SSRF from untrusted `client_id` URLs).
+
+| Mode | Behavior |
+|------|----------|
+| `open` (default) | All CIMD clients allowed |
+| `allowlist` | Only explicitly listed clients/domains permitted |
+| `denylist` | All clients allowed except explicitly blocked ones |
+
+**Pattern types** (semicolon-delimited in `CIMD_ALLOWED_CLIENTS` / `CIMD_DENIED_CLIENTS`):
+- **Exact URL:** `https://vscode.dev/oauth/client-metadata.json`
+- **Exact domain:** `vscode.dev` (matches any CIMD on that host)
+- **Wildcard domain:** `*.microsoft.com` (matches subdomains only)
+
+**Example — allowlist only VS Code and GitHub clients:**
+```json
+{
+  "Values": {
+    "CIMD_POLICY_MODE": "allowlist",
+    "CIMD_ALLOWED_CLIENTS": "https://vscode.dev/oauth/client-metadata.json;*.github.com"
+  }
+}
+```
+
+**Example — block a specific client:**
+```json
+{
+  "Values": {
+    "CIMD_POLICY_MODE": "denylist",
+    "CIMD_DENIED_CLIENTS": "*.untrusted.dev"
+  }
+}
+```
+
+**Check current policy:** `curl http://localhost:7071/cimd-policy`
 
 ### Entra Mode Setup
 
@@ -116,14 +157,12 @@ Set `MCP_AUTH_MODE` in `local.settings.json`:
 ### Prerequisites
 
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)
-- [Azure Functions Core Tools v4](https://docs.microsoft.com/azure/azure-functions/functions-run-local)
-- [Azure Storage Emulator](https://docs.microsoft.com/azure/storage/common/storage-use-azurite) (Azurite) or an Azure Storage account
 
 ### Running Locally
 
 ```bash
-dotnet build MockMcpServer.csproj
-func start --no-build
+dotnet run
+# Server starts on http://localhost:7071
 ```
 
 ### Testing the CIMD Flow
@@ -154,13 +193,12 @@ curl -X POST http://localhost:7071/mcp \
 
 ```
 mock-mcp-server/
-├── Functions/
-│   └── McpFunctions.cs       # All endpoints (MCP, OAuth, consent)
-├── host.json                  # Azure Functions host config (routePrefix: "")
+├── McpServer.cs               # All server logic (MCP, OAuth/CIMD, SSE, backend auth)
+├── Program.cs                 # ASP.NET Core host, route mapping, config loading
+├── MockMcpServer.csproj       # Project file (.NET 8 Web SDK)
 ├── local.settings.json        # Local dev settings (auth mode, credentials)
-├── MockMcpServer.csproj       # Project file
-├── Program.cs                 # App entry point
 ├── samplecalls.http           # HTTP test file for VS Code REST Client
+├── APIHUB_MCP_INTEGRATION.md  # Architecture, requirements, and demo script
 └── README.md
 ```
 

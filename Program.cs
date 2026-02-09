@@ -45,5 +45,6 @@ app.MapPost("/oauth/token", (HttpContext ctx) => mcp.HandleOAuthToken(ctx));
 app.MapGet("/backend-auth/login", (HttpContext ctx) => mcp.HandleBackendAuthLogin(ctx));
 app.MapGet("/backend-auth/callback", (HttpContext ctx) => mcp.HandleBackendAuthCallback(ctx));
 app.MapGet("/backend-auth/status", (HttpContext ctx) => mcp.HandleBackendAuthStatus(ctx));
+app.MapGet("/cimd-policy", (HttpContext ctx) => mcp.HandleCimdPolicy(ctx));
 
 app.Run();

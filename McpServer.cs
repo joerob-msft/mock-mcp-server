@@ -58,6 +58,16 @@ public class McpServer
     private static readonly string BackendScopes = string.IsNullOrEmpty(Environment.GetEnvironmentVariable("BACKEND_SCOPES")) 
         ? "openid profile offline_access" : Environment.GetEnvironmentVariable("BACKEND_SCOPES")!;
 
+    // CIMD policy configuration
+    private static readonly string CimdPolicyMode =
+        Environment.GetEnvironmentVariable("CIMD_POLICY_MODE")?.ToLower() ?? "open";
+    private static readonly string[] CimdAllowedClients =
+        (Environment.GetEnvironmentVariable("CIMD_ALLOWED_CLIENTS") ?? "")
+            .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    private static readonly string[] CimdDeniedClients =
+        (Environment.GetEnvironmentVariable("CIMD_DENIED_CLIENTS") ?? "")
+            .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
     // Backend auth store - maps proxy tokens to backend auth state
     private static readonly ConcurrentDictionary<string, BackendAuthRecord> _backendAuthStore = new();
     // Pending backend auth sessions - maps state param to pending session
@@ -1103,6 +1113,33 @@ public class McpServer
         }, new JsonSerializerOptions { WriteIndented = true }));
     }
 
+    // ── CIMD Policy Endpoint ────────────────────────────────────────────
+
+    /// <summary>
+    /// GET /cimd-policy - Returns current CIMD policy configuration
+    /// </summary>
+    public async Task HandleCimdPolicy(HttpContext context)
+    {
+        context.Response.StatusCode = 200;
+        context.Response.Headers["Content-Type"] = "application/json";
+
+        await context.Response.WriteAsync(JsonSerializer.Serialize(new
+        {
+            mode = CimdPolicyMode,
+            allowed_clients = CimdPolicyMode == "allowlist" ? CimdAllowedClients : Array.Empty<string>(),
+            denied_clients = CimdPolicyMode == "denylist" ? CimdDeniedClients : Array.Empty<string>(),
+            description = CimdPolicyMode switch
+            {
+                "allowlist" => $"Only {CimdAllowedClients.Length} allowed client pattern(s). All others are denied.",
+                "denylist" => $"{CimdDeniedClients.Length} denied client pattern(s). All others are allowed.",
+                "open" => "All CIMD clients are allowed (no restrictions).",
+                _ => $"Unknown mode '{CimdPolicyMode}', defaulting to open."
+            }
+        }, new JsonSerializerOptions { WriteIndented = true }));
+
+        LogResponse("GET /cimd-policy", 200, $"mode={CimdPolicyMode}");
+    }
+
     // ── OAuth / CIMD Endpoints ──────────────────────────────────────────
 
     /// <summary>
@@ -1132,6 +1169,17 @@ public class McpServer
             await WriteOAuthErrorResponse(context, "invalid_request", "client_id and redirect_uri are required");
             return;
         }
+
+        // Evaluate CIMD policy before fetching the document
+        var (policyAllowed, policyReason) = EvaluateCimdPolicy(clientId);
+        if (!policyAllowed)
+        {
+            Console.WriteLine($"{RED}   ✗ CIMD policy denied: {policyReason}{RESET}");
+            await WriteOAuthErrorResponse(context, "access_denied", policyReason ?? "Client not permitted by CIMD policy");
+            return;
+        }
+        if (policyReason != null)
+            Console.WriteLine($"{GREEN}   ✓ CIMD policy: {policyReason}{RESET}");
 
         // Fetch and validate CIMD document
         var (cimdValid, cimdError) = await ValidateCimd(clientId, redirectUri);
@@ -1354,6 +1402,81 @@ public class McpServer
     }
 
     // ── CIMD Validation ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// Evaluates the CIMD policy to determine if a client_id is allowed.
+    /// Called BEFORE fetching the CIMD document to prevent SSRF.
+    /// </summary>
+    private (bool Allowed, string? Reason) EvaluateCimdPolicy(string clientId)
+    {
+        if (CimdPolicyMode == "open")
+            return (true, null);
+
+        if (!Uri.TryCreate(clientId, UriKind.Absolute, out var clientUri))
+            return (false, "client_id is not a valid URL");
+
+        var host = clientUri.Host;
+
+        if (CimdPolicyMode == "allowlist")
+        {
+            if (CimdAllowedClients.Length == 0)
+                return (false, "CIMD allowlist is empty — no clients are permitted");
+
+            if (MatchesAnyPattern(clientId, host, CimdAllowedClients, out var matchedRule))
+                return (true, $"Allowed by rule: {matchedRule}");
+
+            return (false, $"Client '{clientId}' (host: {host}) is not in the CIMD allowlist");
+        }
+
+        if (CimdPolicyMode == "denylist")
+        {
+            if (MatchesAnyPattern(clientId, host, CimdDeniedClients, out var matchedRule))
+                return (false, $"Client '{clientId}' is blocked by denylist rule: {matchedRule}");
+
+            return (true, null);
+        }
+
+        return (true, null); // Unknown mode defaults to open
+    }
+
+    /// <summary>
+    /// Checks if a client_id URL or host matches any pattern in the list.
+    /// Patterns can be: exact URL, exact domain, or wildcard domain (*.example.com).
+    /// </summary>
+    private static bool MatchesAnyPattern(string clientId, string host, string[] patterns, out string? matchedRule)
+    {
+        foreach (var pattern in patterns)
+        {
+            // Exact URL match
+            if (pattern.Contains("://") && string.Equals(pattern, clientId, StringComparison.OrdinalIgnoreCase))
+            {
+                matchedRule = pattern;
+                return true;
+            }
+
+            // Wildcard domain match: *.example.com
+            if (pattern.StartsWith("*."))
+            {
+                var suffix = pattern[1..]; // .example.com
+                if (host.EndsWith(suffix, StringComparison.OrdinalIgnoreCase) && host.Length > suffix.Length)
+                {
+                    matchedRule = pattern;
+                    return true;
+                }
+                continue;
+            }
+
+            // Exact domain match (non-URL patterns without ://)
+            if (!pattern.Contains("://") && string.Equals(pattern, host, StringComparison.OrdinalIgnoreCase))
+            {
+                matchedRule = pattern;
+                return true;
+            }
+        }
+
+        matchedRule = null;
+        return false;
+    }
 
     private async Task<(bool IsValid, string? Error)> ValidateCimd(string clientId, string redirectUri)
     {
