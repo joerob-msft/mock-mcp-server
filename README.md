@@ -70,15 +70,26 @@ Set `MCP_AUTH_MODE` in `local.settings.json`:
 | `mock` (default) | No external calls. Auth codes and tokens generated locally. Good for offline testing. |
 | `entra` | Real Azure AD integration. Redirects to Entra ID for user authentication. Requires AAD app registration. |
 
+### Auth Strategy
+
+Set `MCP_AUTH_STRATEGY` in `local.settings.json`:
+
+| Strategy | Description |
+|----------|-------------|
+| `cimd` (default) | Proxy acts as its own OAuth Authorization Server. Clients authenticate via CIMD. Works with any MCP client. |
+| `entra-direct` | PRM points directly to Entra ID. VS Code uses WAM for silent auth (no browser popup). Only works with Entra-registered clients. |
+
 ### Environment Variables
 
-#### Proxy Auth (AAD App #1 — CIMD)
+#### Proxy Auth (AAD App #1)
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MCP_AUTH_MODE` | `mock` | Auth mode: `mock` or `entra` |
+| `MCP_AUTH_STRATEGY` | `cimd` | Auth strategy: `cimd` (proxy is OAuth AS) or `entra-direct` (Entra ID is AS) |
+| `MCP_EXPOSED_SCOPE` | `Runtime.All` | Exposed scope name on AAD app (used in entra-direct PRM) |
 | `AZURE_TENANT_ID` | `common` | Entra tenant ID |
 | `AZURE_CLIENT_ID` | — | AAD App #1 client ID (proxy) |
-| `AZURE_CLIENT_SECRET` | — | AAD App #1 client secret |
+| `AZURE_CLIENT_SECRET` | — | AAD App #1 client secret (only needed for CIMD strategy) |
 
 #### Backend Auth (AAD App #2 — real MCP server)
 | Variable | Default | Description |
@@ -133,7 +144,7 @@ Controls which MCP clients are permitted to authenticate via CIMD. The policy is
 
 **Check current policy:** `curl http://localhost:7071/cimd-policy`
 
-### Entra Mode Setup
+### Entra Mode Setup (CIMD Strategy)
 
 1. **App #1 (Proxy):** Register in Azure Portal, add redirect URI `http://localhost:7071/oauth/callback`
 2. **App #2 (Backend):** Register separately, add redirect URI `http://localhost:7071/backend-auth/callback`
@@ -142,6 +153,7 @@ Controls which MCP clients are permitted to authenticate via CIMD. The policy is
    {
      "Values": {
        "MCP_AUTH_MODE": "entra",
+       "MCP_AUTH_STRATEGY": "cimd",
        "AZURE_TENANT_ID": "your-tenant-id",
        "AZURE_CLIENT_ID": "app1-client-id",
        "AZURE_CLIENT_SECRET": "app1-secret",
@@ -151,6 +163,32 @@ Controls which MCP clients are permitted to authenticate via CIMD. The policy is
      }
    }
    ```
+
+### Entra-Direct Setup (Silent Auth via WAM)
+
+In this mode, VS Code authenticates silently using the user's existing Microsoft session — no browser popup needed. The PRM points directly to Entra ID as the authorization server.
+
+1. **App #1 (Proxy):** Register in Azure Portal
+2. **Expose an API** on App #1:
+   - Add a scope (e.g., `Runtime.All`)
+   - Pre-authorize VS Code's client ID: `aebc6443-996d-45c2-90f0-388ff96faa56`
+3. **App #2 (Backend):** Register separately, add redirect URI `http://localhost:7071/backend-auth/callback`
+4. Set environment variables in `local.settings.json`:
+   ```json
+   {
+     "Values": {
+       "MCP_AUTH_MODE": "entra",
+       "MCP_AUTH_STRATEGY": "entra-direct",
+       "MCP_EXPOSED_SCOPE": "Runtime.All",
+       "AZURE_TENANT_ID": "your-tenant-id",
+       "AZURE_CLIENT_ID": "app1-client-id",
+       "BACKEND_CLIENT_ID": "app2-client-id",
+       "BACKEND_CLIENT_SECRET": "app2-secret",
+       "BACKEND_SCOPES": "api://app2-client-id/.default"
+     }
+   }
+   ```
+   Note: `AZURE_CLIENT_SECRET` is not needed for entra-direct (the proxy is just a resource server, not an OAuth AS).
 
 ## Local Development
 

@@ -46,6 +46,14 @@ public class McpServer
     private static readonly string AuthMode =
         Environment.GetEnvironmentVariable("MCP_AUTH_MODE")?.ToLower() ?? "mock";
 
+    // Auth strategy: "cimd" (default, proxy is OAuth AS) or "entra-direct" (PRM points to Entra ID)
+    private static readonly string AuthStrategy =
+        Environment.GetEnvironmentVariable("MCP_AUTH_STRATEGY")?.ToLower() ?? "cimd";
+
+    // Exposed scope name on the AAD app (used in entra-direct mode PRM)
+    private static readonly string ExposedScope =
+        Environment.GetEnvironmentVariable("MCP_EXPOSED_SCOPE") ?? "Runtime.All";
+
     private static readonly string TenantId = Environment.GetEnvironmentVariable("AZURE_TENANT_ID") ?? "common";
     private static readonly string? AzureClientId = Environment.GetEnvironmentVariable("AZURE_CLIENT_ID");
     private static readonly string? AzureClientSecret = Environment.GetEnvironmentVariable("AZURE_CLIENT_SECRET");
@@ -91,9 +99,11 @@ public class McpServer
 
     // In Entra mode, scopes must reference the AAD app's resource URI
     private static string GetScopesSupported() =>
-        AuthMode == "entra" && !string.IsNullOrEmpty(AzureClientId)
-            ? $"api://{AzureClientId}/.default"
-            : "mcp.tools.execute";
+        AuthStrategy == "entra-direct" && !string.IsNullOrEmpty(AzureClientId)
+            ? $"api://{AzureClientId}/{ExposedScope}"
+            : AuthMode == "entra" && !string.IsNullOrEmpty(AzureClientId)
+                ? $"api://{AzureClientId}/.default"
+                : "mcp.tools.execute";
 
     /// <summary>
     /// Sends SSE notification for tools/list_changed to a connected client.
@@ -252,10 +262,15 @@ public class McpServer
         context.Response.StatusCode = 200;
         context.Response.Headers["Content-Type"] = "application/json";
 
+        // In entra-direct mode, point to Entra ID as the authorization server
+        var authServers = AuthStrategy == "entra-direct"
+            ? new[] { $"https://login.microsoftonline.com/{TenantId}/v2.0" }
+            : new[] { baseUrl };
+
         var metadata = new
         {
             resource = resourceUrl,
-            authorization_servers = new[] { baseUrl },
+            authorization_servers = authServers,
             scopes_supported = new[] { GetScopesSupported() }
         };
 
@@ -807,7 +822,7 @@ public class McpServer
             return (false, "Token has expired");
         }
 
-        // Fall back to JWT validation (backward compatibility)
+        // Fall back to JWT validation (for entra-direct mode or backward compat)
         try
         {
             var handler = new JwtSecurityTokenHandler();
@@ -820,6 +835,25 @@ public class McpServer
                 Console.WriteLine($"{CYAN}   JWT Issuer: {jwt.Issuer}{RESET}");
                 Console.WriteLine($"{CYAN}   JWT Subject: {jwt.Subject}{RESET}");
                 Console.WriteLine($"{CYAN}   JWT Audiences: {string.Join(", ", jwt.Audiences)}{RESET}");
+            }
+
+            // In entra-direct mode, enforce audience and expiry
+            if (AuthStrategy == "entra-direct" && !string.IsNullOrEmpty(AzureClientId))
+            {
+                // Check audience matches our AAD app
+                var validAudiences = new[] { $"api://{AzureClientId}", AzureClientId };
+                if (!jwt.Audiences.Any(a => validAudiences.Contains(a, StringComparer.OrdinalIgnoreCase)))
+                {
+                    return (false, $"JWT audience '{string.Join(", ", jwt.Audiences)}' does not match expected '{AzureClientId}'");
+                }
+
+                // Check token not expired
+                if (jwt.ValidTo != DateTime.MinValue && jwt.ValidTo < DateTime.UtcNow)
+                {
+                    return (false, "JWT has expired");
+                }
+
+                Console.WriteLine($"{GREEN}   ✓ Entra JWT validated (aud: {AzureClientId}, sub: {jwt.Subject}){RESET}");
             }
 
             return (true, null);
