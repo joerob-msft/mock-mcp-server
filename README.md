@@ -50,6 +50,7 @@ VS Code (MCP Client)
 | GET | `/backend-auth/callback` | Backend auth callback |
 | GET | `/backend-auth/status` | Check backend auth status |
 | GET | `/cimd-policy` | Current CIMD policy configuration |
+| GET/POST | `/backend/mcp` | Backend MCP server (JSON-RPC + SSE) |
 
 ## Supported MCP Methods
 
@@ -58,6 +59,17 @@ VS Code (MCP Client)
 - `tools/call` - Executes a tool call (echo, get_weather, calculate)
 - `resources/list` - Returns available resources (empty)
 - `prompts/list` - Returns available prompts (empty)
+
+## Streaming Proxy Architecture (SSE Sidecar)
+
+After backend auth completes, the proxy needs to receive server-initiated notifications from the backend MCP server. The **BackendSseManager** acts as an in-process SSE sidecar:
+
+1. Client ↔ Proxy: SSE established at `initialize` (proxy token)
+2. After backend auth: sidecar opens SSE to `GET /backend/mcp` (backend token)
+3. Backend sends notification → sidecar reads it → relays via `McpServer.NotifyClient()` → written to client SSE
+4. Tool calls are stateless POST forwarding (proxy → backend), no SSE involved
+
+In production, the sidecar would be a separate Azure Container App per environment, keeping backend SSE connections off APIM.
 
 ## Configuration
 
@@ -231,7 +243,9 @@ curl -X POST http://localhost:7071/mcp \
 
 ```
 mock-mcp-server/
-├── McpServer.cs               # All server logic (MCP, OAuth/CIMD, SSE, backend auth)
+├── McpServer.cs               # Proxy server logic (MCP, OAuth/CIMD, SSE, backend auth)
+├── BackendMcpServer.cs        # Simulated backend MCP server (tools, SSE notifications)
+├── BackendSseManager.cs       # SSE sidecar — manages backend SSE connections per session
 ├── Program.cs                 # ASP.NET Core host, route mapping, config loading
 ├── MockMcpServer.csproj       # Project file (.NET 8 Web SDK)
 ├── local.settings.json        # Local dev settings (auth mode, credentials)

@@ -76,12 +76,15 @@ public class McpServer
         (Environment.GetEnvironmentVariable("CIMD_DENIED_CLIENTS") ?? "")
             .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
+    // Static reference for sidecar manager (set after DI build)
+    internal static BackendSseManager? SseManager;
+
     // Backend auth store - maps proxy tokens to backend auth state
-    private static readonly ConcurrentDictionary<string, BackendAuthRecord> _backendAuthStore = new();
+    internal static readonly ConcurrentDictionary<string, BackendAuthRecord> _backendAuthStore = new();
     // Pending backend auth sessions - maps state param to pending session
     private static readonly ConcurrentDictionary<string, BackendAuthPending> _backendAuthPending = new();
 
-    private record BackendAuthRecord(
+    internal record BackendAuthRecord(
         string ProxyToken, string BackendAccessToken, string? BackendRefreshToken,
         DateTime IssuedAt, int ExpiresIn);
 
@@ -110,16 +113,25 @@ public class McpServer
     /// </summary>
     public static async Task NotifyToolsChanged(string proxyToken)
     {
+        var data = JsonSerializer.Serialize(new { jsonrpc = "2.0", method = "notifications/tools/list_changed" });
+        await NotifyClient(proxyToken, data);
+    }
+
+    /// <summary>
+    /// Sends an arbitrary SSE notification to a connected client.
+    /// Used by BackendSseManager to relay backend notifications.
+    /// </summary>
+    public static async Task NotifyClient(string proxyToken, string notificationJson)
+    {
         if (_sseConnections.TryGetValue(proxyToken, out var conn))
         {
             try
             {
                 if (!conn.RequestAborted.IsCancellationRequested)
                 {
-                    var data = JsonSerializer.Serialize(new { jsonrpc = "2.0", method = "notifications/tools/list_changed" });
-                    await conn.Response.WriteAsync($"event: message\ndata: {data}\n\n", conn.RequestAborted);
+                    await conn.Response.WriteAsync($"event: message\ndata: {notificationJson}\n\n", conn.RequestAborted);
                     await conn.Response.Body.FlushAsync(conn.RequestAborted);
-                    Console.WriteLine($"{GREEN}   ✓ SSE notification sent: tools/list_changed{RESET}");
+                    Console.WriteLine($"{GREEN}   ✓ SSE notification relayed to client{RESET}");
                 }
             }
             catch (OperationCanceledException)
@@ -128,9 +140,26 @@ public class McpServer
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"{RED}   ✗ SSE notification error: {ex.Message}{RESET}");
+                Console.WriteLine($"{RED}   ✗ SSE notification relay error: {ex.Message}{RESET}");
             }
         }
+    }
+
+    /// <summary>
+    /// Checks if a token is a valid backend access token.
+    /// </summary>
+    internal static bool IsValidBackendToken(string token)
+    {
+        return _backendAuthStore.Values.Any(r => r.BackendAccessToken == token);
+    }
+
+    /// <summary>
+    /// Finds the proxy token associated with a backend access token.
+    /// </summary>
+    internal static string? FindProxyTokenByBackendToken(string backendToken)
+    {
+        var record = _backendAuthStore.Values.FirstOrDefault(r => r.BackendAccessToken == backendToken);
+        return record?.ProxyToken;
     }
 
     /// <summary>
@@ -402,8 +431,8 @@ public class McpServer
                 },
                 id = requestId ?? 1
             },
-            "tools/list" => GenerateToolsListResponse(requestId, context),
-            "tools/call" => GenerateToolCallResponse(toolName, toolArguments, requestId, context),
+            "tools/list" => await GenerateToolsListResponseAsync(requestId, context),
+            "tools/call" => await GenerateToolCallResponseAsync(toolName, toolArguments, requestId, context),
             "resources/list" => new
             {
                 jsonrpc = "2.0",
@@ -496,7 +525,7 @@ public class McpServer
             Console.WriteLine($"{MAGENTA}   Tool: {toolName}{RESET}");
     }
 
-    private object GenerateToolsListResponse(int? requestId, HttpContext context)
+    private async Task<object> GenerateToolsListResponseAsync(int? requestId, HttpContext context)
     {
         var proxyToken = ExtractBearerToken(context);
         var hasBackendAuth = proxyToken != null && _backendAuthStore.ContainsKey(proxyToken);
@@ -507,7 +536,13 @@ public class McpServer
         if (hasBackendAuth)
         {
             if (VerboseLogging)
-                Console.WriteLine($"{GREEN}   Backend auth found - full tools list{RESET}");
+                Console.WriteLine($"{GREEN}   Backend auth found - forwarding tools/list to backend{RESET}");
+
+            var backendResult = await ForwardToBackend(proxyToken!, "tools/list", null, requestId);
+            if (backendResult != null) return backendResult;
+
+            // Fallback to local if backend unreachable
+            Console.WriteLine($"{YELLOW}   ⚠ Backend unreachable, falling back to local tools list{RESET}");
             return new
             {
                 jsonrpc = "2.0",
@@ -617,7 +652,7 @@ public class McpServer
         };
     }
 
-    private object GenerateToolCallResponse(string? toolName, JsonElement? arguments, int? requestId, HttpContext context)
+    private async Task<object> GenerateToolCallResponseAsync(string? toolName, JsonElement? arguments, int? requestId, HttpContext context)
     {
         var proxyToken = ExtractBearerToken(context);
         var hasBackendAuth = proxyToken != null && _backendAuthStore.TryGetValue(proxyToken, out var backendRecord);
@@ -728,9 +763,16 @@ public class McpServer
             };
         }
 
-        Console.WriteLine($"{GREEN}   ✓ Backend auth valid - executing tool: {toolName}{RESET}");
-        
-        // Execute the tool
+        Console.WriteLine($"{GREEN}   ✓ Backend auth valid - forwarding tool call to backend: {toolName}{RESET}");
+
+        // Forward tools/call to backend
+        var paramsObj = new Dictionary<string, object?> { ["name"] = toolName };
+        if (arguments.HasValue) paramsObj["arguments"] = arguments.Value;
+        var backendResult = await ForwardToBackend(proxyToken!, "tools/call", paramsObj, requestId);
+        if (backendResult != null) return backendResult;
+
+        // Fallback to local execution if backend unreachable
+        Console.WriteLine($"{YELLOW}   ⚠ Backend unreachable, falling back to local tool execution{RESET}");
         string responseText = toolName switch
         {
             "echo" => GenerateEchoResponse(arguments),
@@ -787,6 +829,53 @@ public class McpServer
         }
         
         return $"The result of '{expression}' is 42. (This is mock data - the answer to everything!)";
+    }
+
+    /// <summary>
+    /// Forwards a JSON-RPC request to the in-process backend MCP server via HTTP.
+    /// Returns the deserialized response object, or null if the backend is unreachable.
+    /// </summary>
+    private async Task<object?> ForwardToBackend(string proxyToken, string method, object? @params, int? requestId)
+    {
+        if (!_backendAuthStore.TryGetValue(proxyToken, out var record))
+            return null;
+
+        var backendUrl = "http://localhost:7071/backend/mcp";
+        var rpcRequest = new Dictionary<string, object?>
+        {
+            ["jsonrpc"] = "2.0",
+            ["method"] = method,
+            ["id"] = requestId ?? 1
+        };
+        if (@params != null) rpcRequest["params"] = @params;
+
+        try
+        {
+            var json = JsonSerializer.Serialize(rpcRequest);
+            using var httpRequest = new HttpRequestMessage(HttpMethod.Post, backendUrl);
+            httpRequest.Content = new StringContent(json, Encoding.UTF8, "application/json");
+            httpRequest.Headers.Add("Authorization", $"Bearer {record.BackendAccessToken}");
+
+            Console.WriteLine($"{CYAN}   → Forwarding {method} to backend: {backendUrl}{RESET}");
+            var httpResponse = await _httpClient.SendAsync(httpRequest);
+            var responseBody = await httpResponse.Content.ReadAsStringAsync();
+
+            if (httpResponse.IsSuccessStatusCode)
+            {
+                Console.WriteLine($"{GREEN}   ← Backend responded {(int)httpResponse.StatusCode}{RESET}");
+                // Return as a raw JsonElement so it serializes faithfully
+                using var doc = JsonDocument.Parse(responseBody);
+                return doc.RootElement.Clone();
+            }
+
+            Console.WriteLine($"{RED}   ← Backend error {(int)httpResponse.StatusCode}: {responseBody}{RESET}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"{RED}   ✗ Backend forward error: {ex.Message}{RESET}");
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -986,6 +1075,13 @@ public class McpServer
             // Notify SSE clients that tools have changed
             await NotifyToolsChanged(proxyToken);
 
+            // Connect the SSE sidecar to the backend for streaming notifications
+            if (SseManager != null)
+            {
+                var mockBaseUrl = GetBaseUrl(context);
+                SseManager.ConnectToBackend(proxyToken, mockToken, $"{mockBaseUrl}/backend/mcp");
+            }
+
             context.Response.StatusCode = 200;
             context.Response.Headers["Content-Type"] = "text/html";
             await context.Response.WriteAsync(@"
@@ -1093,6 +1189,14 @@ public class McpServer
 
             // Notify SSE clients that tools have changed
             await NotifyToolsChanged(pending.ProxyToken);
+
+            // Connect the SSE sidecar to the backend for streaming notifications
+            if (SseManager != null)
+            {
+                var backendMcpUrl = $"{baseUrl}/backend/mcp";
+                SseManager.ConnectToBackend(pending.ProxyToken, backendAccessToken, backendMcpUrl);
+                Console.WriteLine($"{CYAN}   ℹ BackendSseManager connected for proxy→backend streaming{RESET}");
+            }
 
             context.Response.StatusCode = 200;
             context.Response.Headers["Content-Type"] = "text/html";

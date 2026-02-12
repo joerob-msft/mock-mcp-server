@@ -26,6 +26,8 @@ builder.Logging.SetMinimumLevel(LogLevel.Trace);
 builder.Logging.AddConsole();
 
 builder.Services.AddSingleton<McpServer>();
+builder.Services.AddSingleton<BackendMcpServer>();
+builder.Services.AddSingleton<BackendSseManager>();
 
 // Run on port 7071 for local dev
 builder.WebHost.UseUrls("http://0.0.0.0:7071");
@@ -33,6 +35,8 @@ builder.WebHost.UseUrls("http://0.0.0.0:7071");
 var app = builder.Build();
 
 var mcp = app.Services.GetRequiredService<McpServer>();
+var backend = app.Services.GetRequiredService<BackendMcpServer>();
+McpServer.SseManager = app.Services.GetRequiredService<BackendSseManager>();
 
 app.MapGet("/mcp", (HttpContext ctx) => mcp.HandleMcpGet(ctx));
 app.MapPost("/mcp", (HttpContext ctx) => mcp.HandleMcpPost(ctx));
@@ -46,5 +50,7 @@ app.MapGet("/backend-auth/login", (HttpContext ctx) => mcp.HandleBackendAuthLogi
 app.MapGet("/backend-auth/callback", (HttpContext ctx) => mcp.HandleBackendAuthCallback(ctx));
 app.MapGet("/backend-auth/status", (HttpContext ctx) => mcp.HandleBackendAuthStatus(ctx));
 app.MapGet("/cimd-policy", (HttpContext ctx) => mcp.HandleCimdPolicy(ctx));
+app.MapGet("/backend/mcp", (HttpContext ctx) => backend.HandleBackendMcpGet(ctx));
+app.MapPost("/backend/mcp", (HttpContext ctx) => backend.HandleBackendMcpPost(ctx));
 
 app.Run();
