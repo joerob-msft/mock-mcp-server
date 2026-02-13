@@ -318,6 +318,32 @@ public class McpServer
     {
         await LogRequestDetails(context, "GET");
 
+        // In entra-direct mode, return Entra's real OAuth metadata with our scope
+        if (AuthStrategy == "entra-direct")
+        {
+            Console.WriteLine($"{CYAN}   ℹ entra-direct mode: returning Entra OAuth AS metadata{RESET}");
+            var entraBase = $"https://login.microsoftonline.com/{TenantId}/oauth2/v2.0";
+            context.Response.StatusCode = 200;
+            context.Response.Headers["Content-Type"] = "application/json";
+
+            var entraMetadata = new
+            {
+                issuer = $"https://login.microsoftonline.com/{TenantId}/v2.0",
+                authorization_endpoint = $"{entraBase}/authorize",
+                token_endpoint = $"{entraBase}/token",
+                device_authorization_endpoint = $"https://login.microsoftonline.com/{TenantId}/oauth2/v2.0/devicecode",
+                response_types_supported = new[] { "code", "id_token", "code id_token" },
+                grant_types_supported = new[] { "authorization_code", "device_code" },
+                code_challenge_methods_supported = new[] { "S256" },
+                token_endpoint_auth_methods_supported = new[] { "client_secret_post", "private_key_jwt", "client_secret_basic" },
+                scopes_supported = new[] { "openid", "profile", "email", "offline_access", GetScopesSupported() }
+            };
+
+            await context.Response.WriteAsync(JsonSerializer.Serialize(entraMetadata, new JsonSerializerOptions { WriteIndented = true }));
+            LogResponse("GET /.well-known/oauth-authorization-server", 200, "entra-direct → Entra metadata");
+            return;
+        }
+
         var baseUrl = GetBaseUrl(context);
         context.Response.StatusCode = 200;
         context.Response.Headers["Content-Type"] = "application/json";
@@ -386,8 +412,8 @@ public class McpServer
             Console.WriteLine($"{YELLOW}   ⚠ JSON parse error: {ex.Message}{RESET}");
         }
 
-        // Methods that require authentication
-        var requiresAuth = method is "tools/call";
+        // All methods require authentication (matches APIM behavior)
+        var requiresAuth = true;
 
         if (requiresAuth)
         {
